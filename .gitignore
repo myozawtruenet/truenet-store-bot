@@ -1,0 +1,9 @@
+.env
+.env.*
+node_modules/
+*.bak
+*.bak.*
+*.enc
+*.log
+.claude/
+_local_credentials.md
