@@ -13,6 +13,8 @@
  *   /low                            — items at or below threshold
  *   /items [category?]              — list all item codes
  *   /adjust [item] [qty] [reason]   — admin stock adjustment
+ *   /serial [serial_no]             — ONU serial lookup & history
+ *   /return [serial_no]             — return ONU to stock
  *   /chatid                         — print current chat ID (setup helper)
  *   /help                           — command reference
  *
@@ -34,6 +36,10 @@ if (!cfg.telegram.botToken) {
   process.exit(1);
 }
 const bot = new Telegraf(cfg.telegram.botToken);
+
+// ── ONU Serial tracking state ─────────────────────────────────────────────
+// Map key: `${userId}_${chatId}` → pending serial input state
+const pendingSerialInput = new Map();
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -75,6 +81,23 @@ function staffName(from) {
   if (!from) return 'Unknown';
   const name = [from.first_name, from.last_name].filter(Boolean).join(' ');
   return name || from.username || String(from.id);
+}
+
+/** Returns true if the given store_items row is an ONU */
+function isOnuItem(item) {
+  return item && item.category === 'onu';
+}
+
+/**
+ * Log a serial number status change to onu_serial_history.
+ */
+async function logSerialHistory(serialNumber, oldStatus, newStatus, changedBy, changedByTgId, customerId, notes) {
+  await db.query(
+    `INSERT INTO onu_serial_history
+       (serial_number, old_status, new_status, changed_by, changed_by_tg_id, customer_id, notes)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [serialNumber, oldStatus || null, newStatus, changedBy || null, changedByTgId || null, customerId || null, notes || null]
+  );
 }
 
 /**
@@ -293,12 +316,14 @@ bot.command(['help', 'start'], ctx => {
     `/in [item] [qty] [note] — ပစ္စည်းဝင်ရောက်\n` +
     `/out [item] [qty] [note] — ပစ္စည်းထုတ်ပေး\n` +
     `/damage [item] [qty] [note] — ပစ္စည်းပျက်စီး\n` +
-    `/newhome [qty] [onu] [cust_id] — ONU တပ်ဆင်မှတ်တမ်း\n\n` +
+    `/newhome [qty] [onu] [cust_id] — ONU တပ်ဆင်မှတ်တမ်း\n` +
+    `/return [serial_no] — ONU ပြန်လာမှတ်တမ်း\n\n` +
     `<b>📊 Reports (anywhere):</b>\n` +
     `/stock — summary · /stock onu/splitter/cable… · /stock [code]\n` +
     `/daily [date?] — နေ့စဉ် အဝင်အထွက်\n` +
     `/low — နည်းပါးနေသောပစ္စည်းများ\n` +
-    `/items [category?] — ပစ္စည်းစာရင်း\n\n` +
+    `/items [category?] — ပစ္စည်းစာရင်း\n` +
+    `/serial [serial_no] — ONU serial lookup & history\n\n` +
     `<b>🔧 Admin:</b>\n` +
     `/adjust [item] [qty] [reason] — Stock adjustment\n\n` +
     `<b>Item codes:</b> Use /items to see all codes.\n` +
@@ -608,6 +633,30 @@ async function handleTx(ctx, type) {
     // Fetch updated item for threshold check
     const [[updatedItem]] = await db.query('SELECT * FROM store_items WHERE id = ?', [item.id]);
     await checkLowStock(updatedItem);
+
+    // ── ONU serial tracking: prompt for serial numbers ────────
+    if (isOnuItem(item)) {
+      const key = `${ctx.from.id}_${ctx.chat.id}`;
+      const timer = setTimeout(() => pendingSerialInput.delete(key), 120000);
+      pendingSerialInput.set(key, {
+        type,
+        item,
+        qty,
+        staffName: staffName(ctx.from),
+        staffTgId: ctx.from.id,
+        chatId: ctx.chat.id,
+        timer,
+      });
+
+      const actionWord = { in: 'received', out: 'issued', damage: 'damaged' }[type] || type;
+      await ctx.reply(
+        `📋 <b>ONU Serial Numbers Required</b>\n` +
+        `Enter ${qty} serial number(s) for <code>${item.code}</code> (${actionWord})\n` +
+        `(comma-separated or one per line)\n` +
+        `<i>⏱ You have 2 minutes to respond</i>`,
+        { parse_mode: 'HTML' }
+      );
+    }
   } catch (e) {
     console.error(`/${type}`, e);
     await ctx.reply('❌ DB error: ' + e.message);
@@ -686,8 +735,202 @@ bot.command('newhome', async ctx => {
 
     const [[updatedItem]] = await db.query('SELECT * FROM store_items WHERE id = ?', [item.id]);
     await checkLowStock(updatedItem);
+
+    // ── ONU serial tracking: prompt for serial number ─────────
+    if (isOnuItem(item)) {
+      const key = `${ctx.from.id}_${ctx.chat.id}`;
+      const timer = setTimeout(() => pendingSerialInput.delete(key), 120000);
+      pendingSerialInput.set(key, {
+        type: 'newhome',
+        item,
+        qty,
+        customerId,
+        staffName: staffName(ctx.from),
+        staffTgId: ctx.from.id,
+        chatId: ctx.chat.id,
+        timer,
+      });
+
+      await ctx.reply(
+        `📋 <b>ONU Serial Number Required</b>\n` +
+        `Enter ${qty} serial number(s) for this installation\n` +
+        (customerId ? `Customer: <code>${customerId}</code>\n` : '') +
+        `(comma-separated or one per line)\n` +
+        `<i>⏱ You have 2 minutes to respond</i>`,
+        { parse_mode: 'HTML' }
+      );
+    }
   } catch (e) {
     console.error('/newhome', e);
+    await ctx.reply('❌ DB error: ' + e.message);
+  }
+});
+
+// /serial <serial_number> — ONU serial lookup & history
+bot.command('serial', async ctx => {
+  try {
+    const args = ctx.message.text.replace(/^\/\w+(@\S+)?\s*/, '').trim().split(/\s+/);
+    const sn = args[0];
+    if (!sn) {
+      await ctx.reply(
+        'Usage: <code>/serial [serial_number]</code>\nExample: <code>/serial ZTEGC1234567</code>',
+        { parse_mode: 'HTML' }
+      ); return;
+    }
+
+    // Look up the serial
+    const [[serial]] = await db.query(
+      `SELECT os.*, si.code AS item_code, si.name AS item_name, si.unit
+       FROM onu_serials os
+       LEFT JOIN store_items si ON si.id = os.item_id
+       WHERE os.serial_number = ?`,
+      [sn]
+    );
+
+    if (!serial) {
+      await ctx.reply(`❌ Serial number not found: <code>${sn}</code>`, { parse_mode: 'HTML' }); return;
+    }
+
+    const statusEmoji = {
+      received:  '📦',
+      issued:    '📤',
+      installed: '🏠',
+      returned:  '↩️',
+      damaged:   '💥',
+    }[serial.status] || '❓';
+
+    let msg =
+      `${statusEmoji} <b>ONU Serial: <code>${serial.serial_number}</code></b>\n\n` +
+      `<b>Model:</b> ${serial.model || serial.item_name || 'Unknown'}\n` +
+      `<b>Item Code:</b> <code>${serial.item_code || 'N/A'}</code>\n` +
+      `<b>Status:</b> <b>${serial.status.toUpperCase()}</b>\n`;
+
+    if (serial.customer_id)  msg += `<b>Customer:</b> <code>${serial.customer_id}</code>\n`;
+    if (serial.staff_name)   msg += `<b>Last staff:</b> ${serial.staff_name}\n`;
+    if (serial.installed_at) msg += `<b>Installed:</b> ${new Date(new Date(serial.installed_at).getTime() + 6.5*3600000).toISOString().slice(0,16).replace('T',' ')} MMT\n`;
+    if (serial.returned_at)  msg += `<b>Returned:</b> ${new Date(new Date(serial.returned_at).getTime() + 6.5*3600000).toISOString().slice(0,16).replace('T',' ')} MMT\n`;
+    if (serial.damaged_at)   msg += `<b>Damaged:</b> ${new Date(new Date(serial.damaged_at).getTime() + 6.5*3600000).toISOString().slice(0,16).replace('T',' ')} MMT\n`;
+
+    // Fetch history
+    const [history] = await db.query(
+      `SELECT * FROM onu_serial_history WHERE serial_number = ? ORDER BY changed_at ASC`,
+      [sn]
+    );
+
+    if (history.length) {
+      msg += `\n<b>📜 History (${history.length} events):</b>\n<pre>`;
+      msg += 'Time           From       → To        By\n';
+      msg += '────────────────────────────────────────────\n';
+      for (const h of history) {
+        const tLocal = new Date(new Date(h.changed_at).getTime() + 6.5 * 3600 * 1000);
+        const timeStr = tLocal.toISOString().slice(0, 16).replace('T', ' ');
+        const fromStatus = h.old_status ? pad(h.old_status, 9, true) : pad('(new)', 9, true);
+        const toStatus   = pad(h.new_status, 9, true);
+        const by         = (h.changed_by || '?').slice(0, 10);
+        msg += `${timeStr}  ${fromStatus} → ${toStatus} ${by}\n`;
+        if (h.notes) msg += `  ↳ ${h.notes.slice(0, 50)}\n`;
+      }
+      msg += '</pre>';
+    } else {
+      msg += '\n<i>No history recorded.</i>';
+    }
+
+    await sendLong(ctx, msg, { parse_mode: 'HTML' });
+  } catch (e) {
+    console.error('/serial', e);
+    await ctx.reply('❌ Error: ' + e.message);
+  }
+});
+
+// /return <serial_number> — return an ONU to stock
+bot.command('return', async ctx => {
+  if (!isStockGroup(ctx)) {
+    await ctx.reply('⚠️ Transaction commands only work in the stock group.'); return;
+  }
+
+  try {
+    const args = ctx.message.text.replace(/^\/\w+(@\S+)?\s*/, '').trim().split(/\s+/);
+    const sn = args[0];
+    const returnNote = args.slice(1).join(' ') || null;
+
+    if (!sn) {
+      await ctx.reply(
+        'Usage: <code>/return [serial_number] [note?]</code>\nExample: <code>/return ZTEGC1234567</code>',
+        { parse_mode: 'HTML' }
+      ); return;
+    }
+
+    // Look up the serial
+    const [[serial]] = await db.query(
+      `SELECT os.*, si.code AS item_code, si.name AS item_name, si.unit, si.min_threshold
+       FROM onu_serials os
+       LEFT JOIN store_items si ON si.id = os.item_id
+       WHERE os.serial_number = ?`,
+      [sn]
+    );
+
+    if (!serial) {
+      await ctx.reply(`❌ Serial number not found: <code>${sn}</code>`, { parse_mode: 'HTML' }); return;
+    }
+
+    if (!['issued', 'installed'].includes(serial.status)) {
+      await ctx.reply(
+        `❌ Cannot return serial <code>${sn}</code>\n` +
+        `Current status is <b>${serial.status}</b> — only 'issued' or 'installed' ONUs can be returned.`,
+        { parse_mode: 'HTML' }
+      ); return;
+    }
+
+    const oldStatus = serial.status;
+    const sName = staffName(ctx.from);
+    const nowUtc = new Date();
+
+    // Update onu_serials: status = 'returned', clear fields
+    await db.query(
+      `UPDATE onu_serials
+       SET status = 'returned', returned_at = ?, staff_name = ?, staff_tg_id = ?, last_updated = NOW()
+       WHERE serial_number = ?`,
+      [nowUtc, sName, ctx.from.id, sn]
+    );
+
+    // Log history
+    await logSerialHistory(
+      sn, oldStatus, 'returned', sName, ctx.from.id,
+      serial.customer_id,
+      returnNote || `Returned to stock by ${sName}`
+    );
+
+    // Increment stock via postTransaction
+    const tx = await postTransaction({
+      itemId:    serial.item_id,
+      type:      'in',
+      quantity:  1,
+      staffTgId: ctx.from.id,
+      staffName: sName,
+      note:      `ONU return: ${sn}${returnNote ? ' — ' + returnNote : ''}`,
+    });
+
+    if (tx.err) {
+      await ctx.reply(`⚠️ Serial updated but stock increment failed: ${tx.err}`); return;
+    }
+
+    await ctx.reply(
+      `↩️ <b>ONU Returned to Stock</b>\n` +
+      `Serial: <code>${sn}</code>\n` +
+      `Model: ${serial.model || serial.item_name}\n` +
+      `Previous status: ${oldStatus}\n` +
+      (serial.customer_id ? `Customer: <code>${serial.customer_id}</code>\n` : '') +
+      `New stock balance: <b>${fmtQty(tx.balance)} ${serial.unit || 'no'}</b>\n` +
+      `By: ${sName}` +
+      (returnNote ? `\nNote: ${returnNote}` : ''),
+      { parse_mode: 'HTML' }
+    );
+
+    // Check low stock after return (shouldn't trigger but good practice)
+    const [[updatedItem]] = await db.query('SELECT * FROM store_items WHERE id = ?', [serial.item_id]);
+    await checkLowStock(updatedItem);
+  } catch (e) {
+    console.error('/return', e);
     await ctx.reply('❌ DB error: ' + e.message);
   }
 });
@@ -755,6 +998,197 @@ bot.command('adjust', async ctx => {
     conn.release();
     await ctx.reply('❌ Error: ' + e.message);
   }
+});
+
+// ─── ONU Serial input handler ─────────────────────────────────────────────
+// Registered AFTER all bot.command() calls so commands take priority.
+// Intercepts plain-text messages when a serial-input session is pending.
+
+bot.on('text', async (ctx, next) => {
+  // Skip commands
+  if (ctx.message.text.startsWith('/')) return next();
+
+  const key = `${ctx.from.id}_${ctx.chat.id}`;
+  const pending = pendingSerialInput.get(key);
+  if (!pending) return next();
+
+  // Clear pending state immediately (and cancel timeout)
+  clearTimeout(pending.timer);
+  pendingSerialInput.delete(key);
+
+  const rawText = ctx.message.text.trim();
+  const serials = rawText.split(/[\n,]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
+
+  if (!serials.length) {
+    await ctx.reply('❌ No serial numbers detected. Serial tracking skipped for this transaction.'); return;
+  }
+
+  // ── Handle /in (received) ──────────────────────────────────────────────
+  if (pending.type === 'in') {
+    let added = 0;
+    const errors = [];
+    for (const sn of serials) {
+      try {
+        await db.query(
+          `INSERT INTO onu_serials (serial_number, item_id, model, status, staff_name, staff_tg_id)
+           VALUES (?, ?, ?, 'received', ?, ?)`,
+          [sn, pending.item.id, pending.item.name, pending.staffName, pending.staffTgId]
+        );
+        await logSerialHistory(sn, null, 'received', pending.staffName, pending.staffTgId, null, `Received into stock`);
+        added++;
+      } catch (e) {
+        if (e.code === 'ER_DUP_ENTRY') {
+          errors.push(`${sn} (duplicate — already exists)`);
+        } else {
+          errors.push(`${sn} (${e.message})`);
+        }
+      }
+    }
+    let reply = `✅ <b>Serials Recorded (Received)</b>\n`;
+    reply += `Item: <code>${pending.item.code}</code> ${pending.item.name}\n`;
+    reply += `Added: <b>${added}/${serials.length}</b> serial(s)\n`;
+    if (added > 0) {
+      reply += `<pre>${serials.filter((s, i) => !errors.some(e => e.startsWith(s))).join('\n')}</pre>`;
+    }
+    if (errors.length) {
+      reply += `\n⚠️ <b>Errors (${errors.length}):</b>\n<pre>${errors.join('\n')}</pre>`;
+    }
+    await ctx.reply(reply, { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Handle /out (issued) ───────────────────────────────────────────────
+  if (pending.type === 'out') {
+    let updated = 0;
+    const errors = [];
+    const successSerials = [];
+    for (const sn of serials) {
+      const [[existing]] = await db.query(
+        `SELECT * FROM onu_serials WHERE serial_number = ?`, [sn]
+      );
+      if (!existing) {
+        errors.push(`${sn} (not found in database)`);
+        continue;
+      }
+      if (existing.status !== 'received') {
+        errors.push(`${sn} (status is '${existing.status}', expected 'received')`);
+        continue;
+      }
+      try {
+        await db.query(
+          `UPDATE onu_serials
+           SET status = 'issued', staff_name = ?, staff_tg_id = ?, last_updated = NOW()
+           WHERE serial_number = ?`,
+          [pending.staffName, pending.staffTgId, sn]
+        );
+        await logSerialHistory(sn, 'received', 'issued', pending.staffName, pending.staffTgId, null, `Issued from stock`);
+        updated++;
+        successSerials.push(sn);
+      } catch (e) {
+        errors.push(`${sn} (${e.message})`);
+      }
+    }
+    let reply = `✅ <b>Serials Recorded (Issued)</b>\n`;
+    reply += `Item: <code>${pending.item.code}</code> ${pending.item.name}\n`;
+    reply += `Updated: <b>${updated}/${serials.length}</b> serial(s)\n`;
+    if (successSerials.length) reply += `<pre>${successSerials.join('\n')}</pre>`;
+    if (errors.length) reply += `\n⚠️ <b>Errors (${errors.length}):</b>\n<pre>${errors.join('\n')}</pre>`;
+    await ctx.reply(reply, { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Handle /damage ─────────────────────────────────────────────────────
+  if (pending.type === 'damage') {
+    let updated = 0;
+    const errors = [];
+    const successSerials = [];
+    const nowUtc = new Date();
+    for (const sn of serials) {
+      const [[existing]] = await db.query(
+        `SELECT * FROM onu_serials WHERE serial_number = ?`, [sn]
+      );
+      if (!existing) {
+        errors.push(`${sn} (not found in database)`);
+        continue;
+      }
+      if (existing.status === 'damaged') {
+        errors.push(`${sn} (already marked as damaged)`);
+        continue;
+      }
+      try {
+        const oldStatus = existing.status;
+        await db.query(
+          `UPDATE onu_serials
+           SET status = 'damaged', damaged_at = ?, staff_name = ?, staff_tg_id = ?, last_updated = NOW()
+           WHERE serial_number = ?`,
+          [nowUtc, pending.staffName, pending.staffTgId, sn]
+        );
+        await logSerialHistory(sn, oldStatus, 'damaged', pending.staffName, pending.staffTgId, existing.customer_id, `Marked as damaged`);
+        updated++;
+        successSerials.push(sn);
+      } catch (e) {
+        errors.push(`${sn} (${e.message})`);
+      }
+    }
+    let reply = `✅ <b>Serials Recorded (Damaged)</b>\n`;
+    reply += `Item: <code>${pending.item.code}</code> ${pending.item.name}\n`;
+    reply += `Updated: <b>${updated}/${serials.length}</b> serial(s)\n`;
+    if (successSerials.length) reply += `<pre>${successSerials.join('\n')}</pre>`;
+    if (errors.length) reply += `\n⚠️ <b>Errors (${errors.length}):</b>\n<pre>${errors.join('\n')}</pre>`;
+    await ctx.reply(reply, { parse_mode: 'HTML' });
+    return;
+  }
+
+  // ── Handle /newhome (installed) ────────────────────────────────────────
+  if (pending.type === 'newhome') {
+    let updated = 0;
+    const errors = [];
+    const successSerials = [];
+    const nowUtc = new Date();
+    for (const sn of serials) {
+      const [[existing]] = await db.query(
+        `SELECT * FROM onu_serials WHERE serial_number = ?`, [sn]
+      );
+      if (!existing) {
+        errors.push(`${sn} (not found in database)`);
+        continue;
+      }
+      if (!['received', 'issued'].includes(existing.status)) {
+        errors.push(`${sn} (status is '${existing.status}', expected 'received' or 'issued')`);
+        continue;
+      }
+      try {
+        const oldStatus = existing.status;
+        await db.query(
+          `UPDATE onu_serials
+           SET status = 'installed', customer_id = ?, installed_at = ?,
+               staff_name = ?, staff_tg_id = ?, last_updated = NOW()
+           WHERE serial_number = ?`,
+          [pending.customerId || null, nowUtc, pending.staffName, pending.staffTgId, sn]
+        );
+        await logSerialHistory(
+          sn, oldStatus, 'installed', pending.staffName, pending.staffTgId,
+          pending.customerId,
+          `Installed${pending.customerId ? ' for customer ' + pending.customerId : ''}`
+        );
+        updated++;
+        successSerials.push(sn);
+      } catch (e) {
+        errors.push(`${sn} (${e.message})`);
+      }
+    }
+    let reply = `✅ <b>Serials Recorded (Installed)</b>\n`;
+    reply += `Item: <code>${pending.item.code}</code> ${pending.item.name}\n`;
+    if (pending.customerId) reply += `Customer: <code>${pending.customerId}</code>\n`;
+    reply += `Updated: <b>${updated}/${serials.length}</b> serial(s)\n`;
+    if (successSerials.length) reply += `<pre>${successSerials.join('\n')}</pre>`;
+    if (errors.length) reply += `\n⚠️ <b>Errors (${errors.length}):</b>\n<pre>${errors.join('\n')}</pre>`;
+    await ctx.reply(reply, { parse_mode: 'HTML' });
+    return;
+  }
+
+  // Unknown pending type — fall through
+  return next();
 });
 
 // ─── Daily summary cron (8 PM MMT = 13:30 UTC) ────────────────────────────
@@ -890,7 +1324,5 @@ async function main() {
 
 main().catch(e => {
   console.error("[store-bot] Fatal:", e.message || e);
-  
-  
   process.exit(1);
 });
